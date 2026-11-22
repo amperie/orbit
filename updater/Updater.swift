@@ -64,6 +64,84 @@ func verifyArtifact(_ data: Data, _ artifact: Artifact) throws {
         throw UpdateError.invalid("Artifact digest/size rejected")
     }
 }
+
+// Read the universal Mach-O headers directly. /usr/bin/lipo can be a developer
+// tool shim on a customer Mac, so it must not be needed during installation.
+// Signature and signed digest checks remain separate requirements.
+func verifyUniversalExecutable(_ data: Data) throws {
+    func integer(_ offset: Int, _ count: Int, littleEndian: Bool = false) throws -> UInt64 {
+        guard offset >= 0, data.count >= count, offset <= data.count - count else {
+            throw UpdateError.invalid("Truncated executable header")
+        }
+        var value: UInt64 = 0
+        for i in 0..<count {
+            let index = littleEndian ? count - 1 - i : i
+            value = (value << 8) | UInt64(data[data.startIndex + offset + index])
+        }
+        return value
+    }
+    let magic = try integer(0, 4)
+    let wide: Bool, little: Bool
+    switch magic {
+    case 0xcafebabe: (wide, little) = (false, false)
+    case 0xbebafeca: (wide, little) = (false, true)
+    case 0xcafebabf: (wide, little) = (true, false)
+    case 0xbfbafeca: (wide, little) = (true, true)
+    default: throw UpdateError.invalid("A universal Mach-O executable is required")
+    }
+    let count = try integer(4, 4, littleEndian: little)
+    guard (2...64).contains(count) else { throw UpdateError.invalid("Invalid architecture count") }
+    let entrySize = wide ? 32 : 20
+    let tableEnd = 8 + Int(count) * entrySize
+    guard tableEnd <= data.count else { throw UpdateError.invalid("Truncated architecture table") }
+    var ranges: [Range<UInt64>] = []
+    var architectures = Set<String>()
+    var hasARM = false, hasIntel = false
+    for index in 0..<Int(count) {
+        let entry = 8 + index * entrySize
+        let cpu = try integer(entry, 4, littleEndian: little)
+        let subtype = try integer(entry + 4, 4, littleEndian: little)
+        let offset = try integer(entry + 8, wide ? 8 : 4, littleEndian: little)
+        let size = try integer(entry + (wide ? 16 : 12), wide ? 8 : 4, littleEndian: little)
+        let alignment = try integer(entry + (wide ? 24 : 16), 4, littleEndian: little)
+        guard offset >= UInt64(tableEnd), offset <= UInt64(data.count),
+              size >= 32, size <= UInt64(data.count) - offset, alignment < 64,
+              offset & ((UInt64(1) << alignment) - 1) == 0,
+              architectures.insert("\(cpu):\(subtype)").inserted else {
+            throw UpdateError.invalid("Invalid architecture slice")
+        }
+        if wide, try integer(entry + 28, 4, littleEndian: little) != 0 {
+            throw UpdateError.invalid("Invalid reserved architecture field")
+        }
+        let range = offset..<(offset + size)
+        guard !ranges.contains(where: { $0.overlaps(range) }) else {
+            throw UpdateError.invalid("Overlapping architecture slices")
+        }
+        ranges.append(range)
+        let base = Int(offset)
+        let sliceMagic = try integer(base, 4)
+        guard sliceMagic == 0xcffaedfe || sliceMagic == 0xfeedfacf else {
+            throw UpdateError.invalid("Invalid 64-bit Mach-O slice")
+        }
+        let sliceLittle = sliceMagic == 0xcffaedfe
+        let sliceCPU = try integer(base + 4, 4, littleEndian: sliceLittle)
+        let sliceSubtype = try integer(base + 8, 4, littleEndian: sliceLittle)
+        let fileType = try integer(base + 12, 4, littleEndian: sliceLittle)
+        let commands = try integer(base + 16, 4, littleEndian: sliceLittle)
+        let commandBytes = try integer(base + 20, 4, littleEndian: sliceLittle)
+        guard sliceCPU == cpu, sliceSubtype == subtype, fileType == 2,
+              commandBytes <= size - 32, commands <= commandBytes / 8 else {
+            throw UpdateError.invalid("Architecture table does not describe an executable")
+        }
+        // Specialised arm64e/x86_64h slices do not replace the generic builds.
+        let baseSubtype = subtype & 0x00ffffff
+        hasARM = hasARM || (cpu == 0x0100000c && baseSubtype == 0)
+        hasIntel = hasIntel || (cpu == 0x01000007 && baseSubtype == 3)
+    }
+    guard hasARM && hasIntel else {
+        throw UpdateError.invalid("Both arm64 and x86_64 executables are required")
+    }
+}
 func newer(_ manifest: Manifest, state: UpdateState, baseline: Int) -> Bool {
     manifest.sequence > max(state.sequence, baseline) && manifest.sequence != state.failedSequence
 }
@@ -463,10 +541,10 @@ func runUpdate(recoveryOnly: Bool) throws {
         let artifact = manifest.artifacts[name]!
         let bytes = try Download.get(try httpsURL(artifact.url), limit: artifact.size)
         try verifyArtifact(bytes, artifact)
+        try verifyUniversalExecutable(bytes)
         let target = transaction.appendingPathComponent(name + ".new")
         try durableWrite(bytes, to: target, permissions: 0o755)
         try execute("/usr/bin/codesign", ["--verify", "--strict", target.path])
-        try execute("/usr/bin/lipo", [target.path, "-verify_arch", "arm64", "x86_64"])
         let old = try readFile(URL(fileURLWithPath: binaries[name]!), limit: 20_000_000)
         try durableWrite(old, to: transaction.appendingPathComponent(name + ".old"), permissions: 0o755)
         backupHashes[name] = SHA256.hash(data: old).map { String(format:"%02x",$0) }.joined()

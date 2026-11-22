@@ -49,7 +49,7 @@ const run = code => vm.runInContext(code, context);
 const usage = () => ({apps: [
   {id: 'com.operasoftware.Opera', days: {'2026-11-17': 1800, '2026-11-16': 3600, '2026-11-01': 9999}, weeks: {}},
 ], websites: [{id: 'example.com', days: {'2026-11-17': 1200}, weeks: {}}], retentionDays: 90, timeZone: 'America/Los_Angeles', endDate: '2026-11-17'});
-const responseFor = path => path === '/api/admin/ios/state' ? {policy:{schemaVersion:1, revision:1, blocked:false, dailyMinutes:null, timeZone:'America/Los_Angeles'}, devices:[], enrolled:[]} : path === '/api/admin/usage' ? usage() :
+const responseFor = path => path === '/api/admin/remote-access' ? {devices:[]} : path === '/api/admin/ios/state' ? {policy:{schemaVersion:1, revision:1, blocked:false, dailyMinutes:null, timeZone:'America/Los_Angeles'}, devices:[], enrolled:[]} : path === '/api/admin/usage' ? usage() :
   path === '/api/admin/activity' ? {current: null, lastSeen: null, events: []} :
   path === '/api/admin/alerts' ? {alerts: []} :
   path === '/api/admin/health' ? {deviceConnected: true, monitorConnected: true, browserProtectionVerified: false} : fresh();
@@ -597,5 +597,41 @@ const responseFor = path => path === '/api/admin/ios/state' ? {policy:{schemaVer
   assert.equal(warnedAboutDrafts, true, 'Leaving the website must warn about unsaved iPhone rules');
   assert.equal(unload.returnValue, '');
   run('iosDirty = false');
+  let remoteEnabled = false, remoteRevision = 0;
+  fetchImpl = async (path, options) => {
+    assert.equal(path, '/api/admin/remote-access');
+    if (options.method === 'POST') {
+      const posted = JSON.parse(options.body);
+      assert.deepEqual(Object.keys(posted).sort(), ['enabled','hostname','revision']);
+      assert.equal(posted.revision, remoteRevision++); remoteEnabled = posted.enabled;
+    }
+    return {ok:true,json:async()=>({devices:[{hostname:'daughter.local', enabled:remoteEnabled, revision:remoteRevision, fresh:true, status:{sshReady:true,state:'disabled'},serverTimeUTC:new Date().toISOString(),lastSeen:new Date().toISOString(),expiresAt:remoteEnabled ? new Date(Date.now()+3600000).toISOString() : null}]})};
+  };
+  run('dirty = true');
+  await get('remote-refresh').onclick();
+  await get('remote-devices').children[0].children[2].onclick();
+  assert.equal(remoteEnabled, true);
+  assert.match(get('remote-devices').children[0].children[1].textContent, /on.*60 min remaining/);
+  assert.equal(run('dirty'), true, 'Remote access must preserve unsaved app rules');
+  assert.match(get('remote-devices').children[0].children[1].textContent, /Tunnel closed.*Requested: on/, 'Requested access is not proof of connectivity');
+  await get('remote-devices').children[0].children[2].onclick();
+  assert.equal(remoteEnabled, false);
+  fetchImpl = async () => ({ok:true,json:async()=>({devices:[{hostname:'offline',enabled:false,revision:0,fresh:false,status:null}]})});
+  await get('remote-refresh').onclick();
+  assert.equal(get('remote-devices').children[0].children[2].disabled, true, 'Action cleanup must keep unprovisioned devices disabled');
+  const reportTime = Date.now();
+  const liveTunnel = {enabled:true, fresh:true, serverTimeUTC:new Date(reportTime).toISOString(), lastSeen:new Date(reportTime).toISOString(), expiresAt:new Date(reportTime+3600000).toISOString(), status:{state:'connected',sshReady:true}};
+  context.liveTunnel = liveTunnel; context.reportTime = reportTime;
+  assert.match(run('remoteView(liveTunnel, reportTime, reportTime).text'), /Tunnel connected/);
+  assert.match(run('remoteView(liveTunnel, reportTime, reportTime + 41000).text'), /Status unknown/, 'Cached reports must age out even without a successful refresh');
+  const expiredTunnel = {...liveTunnel, serverTimeUTC:new Date(reportTime+3600000).toISOString(), lastSeen:new Date(reportTime+3600000).toISOString()};
+  context.expiredTunnel = expiredTunnel;
+  assert.match(run('remoteView(expiredTunnel, reportTime, reportTime).text'), /Tunnel connected.*Requested: off.*confirm closure/, 'Expiration must not falsely claim observed closure');
+  assert.equal(run('remoteView(expiredTunnel, reportTime, reportTime).enabled'), false);
+  fetchImpl = async () => ({ok:true,json:async()=>({devices:[liveTunnel]})});
+  await get('remote-refresh').onclick();
+  fetchImpl = async () => {throw Error('Remote status request failed');};
+  await get('remote-refresh').onclick();
+  assert.match(get('remote-devices').children[0].children[1].textContent, /Status unknown/, 'Failed refresh must clear previously reported connectivity');
   console.log('Dashboard regression checks passed');
 })().catch(error => { console.error(error); process.exitCode = 1; });

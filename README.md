@@ -241,3 +241,7 @@ Implementation directories: `agent/`, `server/`, `browser/`, `packaging/`, `upda
 ## iPhone app
 
 The first native iPhone version is in [`ios/`](ios/README.md), with a SwiftUI app, Device Activity Monitor extension, and separate server policy/status APIs. Website **Settings → iPhone setup** generates a single-use setup code; enter it in Orbit to download the device credential and rules automatically from `https://orbit.side-forge.com`. The website also supports shared iPhone rules and individual credential revocation. It requires iOS 17.4+, Apple signing/capabilities, and physical-device enforcement tests. It is not yet a deployed or device-verified parental-control release.
+
+## Private remote SSH access
+
+Optional [secure tunnel setup](tunnel/README.md) adds **Settings → Remote SSH access**. Your personal SSH key is required; the VPS port is private and access expires automatically after one hour. The web app shows the remaining window separately from the helper’s reported connection state. Provisioning is separate from the normal agent installer and stays off by default.

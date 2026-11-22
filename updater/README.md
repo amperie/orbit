@@ -4,6 +4,14 @@ Automatic updates replace **only the agent and bundled foreground monitor**.
 The updater, installers, launchd definitions, settings, credentials, and browser
 extensions are not downloaded or rewritten by an automatic update.
 
+The installed updater does not require Xcode or Apple Command Line Tools.
+It checks universal Mach-O architecture headers directly, requiring generic
+arm64 and x86_64 executable slices, in addition to the existing signed manifest,
+size, hash, and system code-signature checks. Architecture checks do not run
+`lipo` on the target Mac. Developer tools remain necessary on the build machine.
+If an older updater fails with `/usr/bin/lipo`, manually run an installer built
+with this fix: automatic agent updates do not replace the updater itself.
+
 The installer includes an hourly root LaunchDaemon. It is loaded only when an
 administrator has provisioned a pinned Ed25519 public key. Builds without a key
 leave automatic installation disabled, including an explicit launchd override

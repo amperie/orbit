@@ -31,6 +31,10 @@ func stopService(_ service: String) throws {
 }
 
 let installedFiles = [
+    "/private/etc/ssh/orbit-tunnel-parent-key",
+    "/Library/LaunchDaemons/com.side-forge.orbit.tunnel.plist",
+    "/Library/LaunchDaemons/com.side-forge.orbit.tunnel-sshd.plist",
+    "/Library/PrivilegedHelperTools/orbit-tunnel",
     "/Library/LaunchDaemons/com.side-forge.orbit.agent.plist",
     "/Library/PrivilegedHelperTools/orbit-agent",
     "/usr/local/libexec/orbit-foreground",
@@ -143,6 +147,8 @@ func removeInstallation(purge: Bool) throws {
         else { throw RemovalError.message("Cannot inspect browser settings directory") }
         if directory.hasSuffix("/Browser") { try removeFile(directory + "/Orbit-Chrome.mobileconfig") }
     }
+    try stopService("system/com.side-forge.orbit.tunnel")
+    try stopService("system/com.side-forge.orbit.tunnel-sshd")
     try stopService("system/com.side-forge.orbit.agent")
     for (name, uid, home) in accounts {
         try stopService("gui/\(uid)/com.side-forge.orbit.foreground")

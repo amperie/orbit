@@ -48,6 +48,11 @@
     </div>
     <div id="panel-protection" role="tabpanel" aria-labelledby="tab-protection" tabindex="0" hidden>
       <div class="page-title"><h1>Settings</h1><p>Schedules, protection and account activity.</p></div>
+      <section aria-labelledby="remote-heading">
+        <div class="line"><h2 id="remote-heading">Remote SSH access</h2><button id="remote-refresh" type="button" class="secondary">Refresh remote access</button></div>
+        <p class="hint">Your SSH key is required. Access uses a private VPS port and turns off automatically after one hour. The Mac must be awake and online. The Mac enforces expiration even if it cannot contact the server. Changes arrive at the next helper check; refresh to confirm.</p>
+        <div id="remote-devices" aria-live="polite">Refresh to check secure tunnel setup.</div>
+      </section>
       <section aria-labelledby="ios-heading">
         <div class="line"><h2 id="ios-heading">iPhone setup</h2><button id="ios-refresh" type="button" class="secondary">Refresh iPhones</button></div>
         <p class="hint">Install Orbit on the iPhone, then enter a setup code. The server address, device credential and rules are configured automatically. Apple approval and app selection still happen on the phone.</p>

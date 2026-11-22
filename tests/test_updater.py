@@ -4,6 +4,7 @@ import json
 import os
 from pathlib import Path
 import shutil
+import struct
 import subprocess
 import sys
 import tempfile
@@ -36,6 +37,8 @@ do {
     } else if mode == "digest" {
         let data = try Data(contentsOf: URL(fileURLWithPath: CommandLine.arguments[2]))
         try verifyArtifact(data, Artifact(url:"https://example.test/a", sha256:CommandLine.arguments[3], size:Int(CommandLine.arguments[4])!))
+    } else if mode == "architectures" {
+        try verifyUniversalExecutable(Data(contentsOf:URL(fileURLWithPath:CommandLine.arguments[2])))
     } else if mode == "recover" {
         var state = UpdateState(sequence: CommandLine.arguments[2] == "stale" ? 3 : (CommandLine.arguments[2] == "committed" ? 2 : 1), failedSequence: CommandLine.arguments[2] == "rolled-back" ? 2 : 0, version:"old")
         var events: [String] = []
@@ -215,6 +218,78 @@ do {
         self.assertEqual(check(digest,7),0)
         self.assertNotEqual(check(digest,6),0)
         self.assertNotEqual(check('0'*64,7),0)
+
+    @staticmethod
+    def universal_fixture(wide=False, little=False):
+        order = '<' if little else '>'
+        magic = 0xcafebabf if wide else 0xcafebabe
+        header = struct.pack(order + 'II', magic, 2)
+        entries = bytearray()
+        payload = bytearray(512)
+        for cpu, subtype, offset in [(0x0100000c, 0, 128), (0x01000007, 3, 256)]:
+            if wide:
+                entries.extend(struct.pack(order + 'IIQQII', cpu, subtype, offset, 64, 6, 0))
+            else:
+                entries.extend(struct.pack(order + 'IIIII', cpu, subtype, offset, 64, 6))
+            payload[offset:offset+32] = struct.pack('<IIIIIIII', 0xfeedfacf, cpu, subtype, 2, 0, 0, 0, 0)
+        payload[:len(header + entries)] = header + entries
+        return payload
+
+    def check_architectures(self, data):
+        path = self.root / 'architecture-fixture'
+        path.write_bytes(data)
+        return subprocess.run([str(self.harness), 'architectures', str(path)], capture_output=True).returncode
+
+    def test_native_architecture_check_accepts_universal_formats(self):
+        for wide in (False, True):
+            for little in (False, True):
+                with self.subTest(wide=wide, little=little):
+                    self.assertEqual(self.check_architectures(self.universal_fixture(wide, little)), 0)
+
+    def test_native_architecture_check_rejects_malformed_or_incomplete_binaries(self):
+        valid = self.universal_fixture()
+        cases = [b'', b'not a Mach-O binary', valid[:7], valid[:40], valid[:280], valid[128:192]]
+        def changed(offset, value, format='>I', source=valid):
+            data = bytearray(source)
+            struct.pack_into(format, data, offset, value)
+            return data
+        cases.extend([
+            changed(4, 0), changed(4, 1), changed(4, 0xffffffff),
+            changed(16, 0),                       # Slice inside the architecture table.
+            changed(16, 0xfffffff0),              # Offset beyond the file.
+            changed(20, 0xffffffff),              # Size overflows the file.
+            changed(20, 16),                      # Truncated Mach-O header.
+            changed(24, 64),                      # Invalid alignment exponent.
+            changed(24, 8),                       # Offset not aligned as advertised.
+            changed(36, 128),                     # Overlap another slice.
+            changed(132, 0x01000007, '<I'),        # Fat/inner CPU mismatch.
+            changed(140, 6, '<I'),                # Dylib instead of executable.
+            changed(144, 1, '<I'),                # Load commands don't fit.
+            changed(148, 64, '<I'),               # Commands exceed slice bounds.
+        ])
+        duplicate = bytearray(valid)
+        duplicate[28:36] = duplicate[8:16]
+        cases.append(duplicate)
+        for entry, base, subtype in [(8, 128, 2), (28, 256, 8)]:
+            specialised = changed(entry + 4, subtype)
+            struct.pack_into('<I', specialised, base + 8, subtype)
+            cases.append(specialised)  # arm64e/x86_64h cannot substitute for generic architectures.
+        wide = self.universal_fixture(wide=True)
+        cases.extend([changed(16, 0xfffffffffffffff0, '>Q', wide),
+                      changed(24, 0xffffffffffffffff, '>Q', wide), changed(36, 1, '>I', wide)])
+        for index, data in enumerate(cases):
+            with self.subTest(case=index):
+                self.assertNotEqual(self.check_architectures(data), 0)
+
+    def test_native_architecture_check_accepts_real_compiled_universal_executable(self):
+        path = self.root / 'universal-executable'
+        source = self.root / 'universal-fixture.c'
+        source.write_text('int main(void) { return 0; }')
+        # Developer tools are used only to build this test fixture, never by the updater.
+        subprocess.run(['/usr/bin/xcrun', 'clang', '-arch', 'arm64', '-arch', 'x86_64',
+                        str(source), '-o', str(path)],
+                       check=True, capture_output=True)
+        self.assertEqual(self.check_architectures(path.read_bytes()), 0)
 
     def test_recovery_order_and_retry_on_partial_failure(self):
         expected = ['restore-agent','restore-monitor','restart','save','cleanup']

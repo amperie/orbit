@@ -24,6 +24,27 @@ class AgentValidationTests(unittest.TestCase):
         subprocess.run(['swiftc', '-module-cache-path', str(Path(cls.tmp.name) / 'modules'),
                         str(harness), '-framework', 'Security', '-o', cls.harness], check=True, capture_output=True)
 
+        # Inject a missing executable to exercise every failed-launch cleanup
+        # without needing process inspection permissions or killing any apps.
+        resource_harness = Path(cls.tmp.name) / 'resource-check.swift'
+        failed_source = source.replace('URL(fileURLWithPath: "/bin/ps")',
+                                       'URL(fileURLWithPath: "/nonexistent-orbit-fd-fixture")')
+        resource_harness.write_text(failed_source + r'''
+func openDescriptors() -> Int {
+    (0..<getdtablesize()).reduce(0) { $0 + (fcntl($1, F_GETFD) == -1 ? 0 : 1) }
+}
+let fixturePolicy = try decoder.decode(Policy.self, from: Data(#"{"schemaVersion":1,"revision":1,"apps":[{"name":"Fixture","bundleId":"org.orbit.fd.fixture","blocked":true}]}"#.utf8))
+let baseline = openDescriptors()
+for _ in 0..<200 {
+    // Deliberately no autorelease pool: pipe cleanup must work independently.
+    precondition(enforce(fixturePolicy, development:true, dryRun:true) == "Cannot enumerate processes")
+}
+print("\(baseline) \(openDescriptors())")
+''')
+        cls.resources = str(Path(cls.tmp.name) / 'resource-check')
+        subprocess.run(['swiftc', '-module-cache-path', str(Path(cls.tmp.name) / 'modules'),
+                        str(resource_harness), '-framework', 'Security', '-o', cls.resources], check=True, capture_output=True)
+
     @classmethod
     def tearDownClass(cls):
         cls.tmp.cleanup()
@@ -33,6 +54,11 @@ class AgentValidationTests(unittest.TestCase):
         path.write_text(json.dumps(payload))
         result = subprocess.run([self.binary, mode, str(path)], capture_output=True, text=True)
         self.assertEqual(result.returncode, 0 if valid else 1, result.stderr)
+
+    def test_failed_process_scans_do_not_leak_file_descriptors(self):
+        result = subprocess.run([self.resources], check=True, capture_output=True, text=True, timeout=20)
+        before, after = map(int, result.stdout.split())
+        self.assertEqual(after, before, 'Failed process scans must close pipes even without an autorelease pool')
 
     def test_settings_validation_before_install(self):
         for url, valid in [('https://example.com', True), ('https://example.com/', True),

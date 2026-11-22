@@ -180,8 +180,10 @@ function renderDeviceStatus() {
   $('health').textContent = device?.report.lastError ? `Agent needs attention: ${device.report.lastError}` : '';
 }
 async function load() { if (dirty) throw Error('Save your changes, or use Discard changes and reload.'); state = await api('/api/admin/state'); ++connectionGeneration; acceptServerTime(state.serverTimeUTC); $('controls').hidden = false; $('login').hidden = true; render(); }
+let remoteButtons = [], remoteGeneration = 0;
 function setControlsDisabled(value) {
   document.querySelectorAll('button, input, select, textarea').forEach(element => { element.disabled = value; });
+  if (!value) for (const item of remoteButtons) item.button.disabled = item.unavailable;
 }
 function action(fn) { return async event => {
   event?.preventDefault();
@@ -630,7 +632,7 @@ for (const [index, name] of tabNames.entries()) {
     showTab(name);
     if (name === 'monitoring' || name === 'websites') await refreshMonitoring();
     if (name === 'blocking') await refreshMonitoring();
-    if (name === 'protection') await waitForRequests([loadSecurityHealth(), loadAlerts(), loadIPhones()]);
+    if (name === 'protection') await waitForRequests([loadSecurityHealth(), loadAlerts(), loadIPhones(), loadRemoteAccess()]);
   });
   $('tab-' + name).addEventListener('keydown', event => {
     let next;
@@ -714,12 +716,14 @@ function renderUsageCharts() {
 }
 $('usage-period').addEventListener('change', renderUsageCharts);
 window.setInterval(() => {
+  refreshRemoteDisplay();
   if (!token || !state || $('controls').hidden || busy || backgroundBusy || document.hidden) return;
   backgroundBusy = true;
   void (async () => {
     try {
       await refreshConnections();
       await refreshMonitoring();
+      if (activeTab === 'protection') await loadRemoteAccess();
     } catch (error) { $('message').textContent = 'Activity refresh failed: ' + error.message; }
     finally { backgroundBusy = false; }
   })();
@@ -757,3 +761,62 @@ async function connectFromLink() {
   $('token').value = '';
 }
 void connectFromLink();
+
+function remoteView(device, loadedAt, now = Date.now()) {
+  const elapsed = Math.max(0, now - loadedAt);
+  const serverNow = Date.parse(device.serverTimeUTC) + elapsed;
+  const age = serverNow - Date.parse(device.lastSeen);
+  const fresh = device.fresh && Number.isFinite(age) && age >= 0 && age <= 40000;
+  const seconds = Math.max(0, Math.ceil((Date.parse(device.expiresAt) - serverNow) / 1000));
+  const enabled = device.enabled && seconds > 0;
+  const observed = !fresh ? 'Status unknown (no recent report)' : device.status?.state === 'connected' ? 'Tunnel connected' : device.status?.state === 'connecting' ? 'Connecting' : device.status?.state === 'error' ? 'Setup needs attention' : 'Tunnel closed';
+  const requested = enabled ? `on · ${Math.ceil(seconds / 60)} min remaining · expires ${new Date(device.expiresAt).toLocaleTimeString()}` : 'off';
+  const pending = fresh && device.status?.state === 'connected' && !enabled ? ' Waiting for the Mac to confirm closure.' : '';
+  return {fresh, enabled, text:`${observed}. Requested: ${requested}.${pending} ${device.status?.message || ''}`};
+}
+function refreshRemoteDisplay() {
+  for (const item of remoteButtons) item.update?.();
+}
+
+async function loadRemoteAccess() {
+  const generation = ++remoteGeneration;
+  let data;
+  try { data = await api('/api/admin/remote-access'); }
+  catch (error) {
+    if (generation !== remoteGeneration) return;
+    for (const item of remoteButtons) {
+      item.update = null;
+      item.description.textContent = 'Status unknown. Refresh to verify remote access.';
+      if (!item.enabled) { item.unavailable = true; item.button.disabled = true; }
+    }
+    throw error;
+  }
+  if (generation !== remoteGeneration) return;
+  const root = $('remote-devices'); root.replaceChildren(); remoteButtons = [];
+  if (!data.devices.length) root.textContent = 'No Macs connected. Install and provision the secure tunnel helper first.';
+  for (const device of data.devices) {
+    const row = document.createElement('div'); row.className = 'device-card';
+    const name = document.createElement('strong'); name.textContent = device.hostname;
+    const description = document.createElement('p');
+    const button = document.createElement('button'); button.type = 'button'; button.className = 'secondary';
+    const loadedAt = Date.now();
+    const item = {button, description};
+    item.update = () => {
+      const view = remoteView(device, loadedAt);
+      item.enabled = view.enabled;
+      item.unavailable = !view.enabled && (!view.fresh || !device.status?.sshReady);
+      description.textContent = view.text;
+      button.textContent = view.enabled ? 'Turn off SSH access' : 'Enable SSH for 1 hour';
+      button.disabled = busy || item.unavailable;
+      button.setAttribute('aria-label', button.textContent + ' for ' + device.hostname);
+    };
+    item.update(); remoteButtons.push(item);
+    button.onclick = action(async () => {
+      ++remoteGeneration;
+      await api('/api/admin/remote-access', {hostname:device.hostname, revision:device.revision, enabled:!remoteView(device, loadedAt).enabled});
+      await loadRemoteAccess();
+    });
+    row.append(name, description, button); root.append(row);
+  }
+}
+$('remote-refresh').onclick = action(loadRemoteAccess);

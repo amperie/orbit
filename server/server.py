@@ -10,6 +10,7 @@ import sqlite3
 import threading
 import datetime
 import uuid
+from urllib.parse import urlsplit, parse_qs
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -256,6 +257,8 @@ def validate_ios_status(data):
 
 def init_db():
     with sqlite3.connect(DB) as conn:
+        conn.execute('CREATE TABLE IF NOT EXISTS remote_access (hostname TEXT PRIMARY KEY, revision INTEGER NOT NULL, enabled INTEGER NOT NULL, expires REAL NOT NULL)')
+        conn.execute('CREATE TABLE IF NOT EXISTS tunnel_status (hostname TEXT PRIMARY KEY, payload TEXT NOT NULL, seen REAL NOT NULL)')
         conn.execute('CREATE TABLE IF NOT EXISTS ios_policy (id INTEGER PRIMARY KEY, payload TEXT NOT NULL)')
         conn.execute('INSERT OR IGNORE INTO ios_policy VALUES (1, ?)', (json.dumps(default_ios_policy()),))
         conn.execute('CREATE TABLE IF NOT EXISTS ios_status (installation_id TEXT PRIMARY KEY, payload TEXT NOT NULL, seen TEXT NOT NULL)')
@@ -395,10 +398,40 @@ def connections_report(now=None):
     return dict(devices=devices, serverTimeUTC=now.isoformat())
 
 
+def tunnel_hostname(value):
+    if not isinstance(value, str) or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._-]{0,252}', value):
+        raise ValueError('Invalid Mac hostname')
+    return value.casefold().rstrip('.')
+
+
+def tunnel_control(conn, hostname, now):
+    row = conn.execute('SELECT revision,enabled,expires FROM remote_access WHERE hostname=?', (hostname,)).fetchone()
+    return dict(hostname=hostname, revision=row[0] if row else 0,
+                enabled=bool(row and row[1] and row[2] > now),
+                expiresAt=datetime.datetime.fromtimestamp(row[2], datetime.timezone.utc).isoformat() if row and row[1] and row[2] > 0 else None,
+                serverTimeUTC=datetime.datetime.fromtimestamp(now, datetime.timezone.utc).isoformat())
+
+
+def tunnel_report():
+    now = time.time()
+    with sqlite3.connect(DB) as conn:
+        hosts = conn.execute("SELECT hostname FROM device_status WHERE hostname != '' UNION SELECT hostname FROM tunnel_status UNION SELECT hostname FROM remote_access ORDER BY hostname").fetchall()
+        devices = []
+        for (host,) in hosts:
+            control = tunnel_control(conn, host, now)
+            status = conn.execute('SELECT payload,seen FROM tunnel_status WHERE hostname=?', (host,)).fetchone()
+            control['status'] = json.loads(status[0]) if status else None
+            control['fresh'] = bool(status and 0 <= now - status[1] <= 40)
+            control['lastSeen'] = datetime.datetime.fromtimestamp(status[1], datetime.timezone.utc).isoformat() if status else None
+            devices.append(control)
+    return dict(devices=devices)
+
+
 def delete_connection(conn, hostname):
     key = hostname.casefold().rstrip('.') if hostname is not None else ''
     removed = conn.execute('SELECT payload FROM device_status WHERE hostname=?', (key,)).fetchone()
     conn.execute('DELETE FROM device_status WHERE hostname=?', (key,))
+    conn.execute('UPDATE remote_access SET enabled=0, expires=0, revision=revision+1 WHERE hostname=?', (key,))
     latest = conn.execute('SELECT payload FROM status WHERE id=1').fetchone()
     if latest and (json.loads(latest[0]).get('hostname', '').casefold().rstrip('.') == key or
                    (removed and removed[0] == latest[0])):
@@ -660,7 +693,54 @@ class Handler(BaseHTTPRequestHandler):
         except (ValueError, TypeError, KeyError, OverflowError, TimeoutError):
             self.reply(400, {'error': 'Invalid iPhone policy or status'})
 
+    def tunnel_request(self, post=False):
+        admin = self.path == '/api/admin/remote-access'
+        credential = ADMIN if admin else DEVICE
+        # Fail closed even if startup validation was bypassed by an embedding process.
+        if len(credential) < 32:
+            return self.reply(503, {'error': 'Remote access credentials are not configured'})
+        if not self.authorized(credential):
+            return
+        try:
+            if not post:
+                if admin:
+                    return self.reply(200, tunnel_report())
+                query = parse_qs(urlsplit(self.path).query, strict_parsing=True)
+                if set(query) != {'hostname'} or len(query['hostname']) != 1:
+                    raise ValueError('Supply one hostname')
+                hostname = tunnel_hostname(query['hostname'][0])
+                with sqlite3.connect(DB) as conn:
+                    result = tunnel_control(conn, hostname, time.time())
+                return self.reply(200, result)
+            data = self.body()
+            if not isinstance(data, dict):
+                raise ValueError('Expected an object')
+            hostname = tunnel_hostname(data.get('hostname'))
+            with LOCK, sqlite3.connect(DB) as conn:
+                if admin:
+                    if set(data) != {'hostname', 'revision', 'enabled'} or type(data['enabled']) is not bool or type(data['revision']) is not int:
+                        raise ValueError('Invalid remote access request')
+                    control = tunnel_control(conn, hostname, time.time())
+                    if control['revision'] != data['revision']:
+                        return self.reply(409, {'error': 'Remote access changed. Refresh and try again.'})
+                    status = conn.execute('SELECT payload,seen FROM tunnel_status WHERE hostname=?', (hostname,)).fetchone()
+                    if data['enabled'] and (not status or not 0 <= time.time() - status[1] <= 40 or not json.loads(status[0])['sshReady']):
+                        raise ValueError('Complete secure tunnel setup on this Mac first')
+                    conn.execute('INSERT OR REPLACE INTO remote_access VALUES (?,?,?,?)',
+                                 (hostname, control['revision'] + 1, int(data['enabled']), time.time() + 3600 if data['enabled'] else 0))
+                    conn.execute("INSERT INTO alerts(kind,message,created) VALUES ('remote-access',?,?)",
+                                 ('Parent requested SSH access ' + ('on for one hour' if data['enabled'] else 'off') + ' for ' + hostname, datetime.datetime.now(datetime.timezone.utc).isoformat()))
+                else:
+                    if set(data) != {'hostname', 'state', 'sshReady', 'remotePort', 'message'} or data['state'] not in ('connected', 'connecting', 'disabled', 'error') or type(data['sshReady']) is not bool or type(data['remotePort']) is not int or not 1024 <= data['remotePort'] <= 65535 or not isinstance(data['message'], str) or len(data['message']) > 300:
+                        raise ValueError('Invalid tunnel status')
+                    conn.execute('INSERT OR REPLACE INTO tunnel_status VALUES (?,?,?)', (hostname, json.dumps(data), time.time()))
+            return self.reply(200, tunnel_report() if admin else {'ok': True})
+        except (ValueError, TypeError, KeyError) as error:
+            self.reply(400, {'error': str(error)})
+
     def do_GET(self):
+        if self.path == '/api/admin/remote-access' or self.path.startswith('/api/device/remote-access?'):
+            return self.tunnel_request()
         if self.path in ('/api/ios/policy', '/api/ios/parent/policy', '/api/admin/ios/policy', '/api/admin/ios/state'):
             return self.ios_get()
         if self.path.split("?", 1)[0] in ("/privacy", "/privacy/"):
@@ -720,6 +800,8 @@ class Handler(BaseHTTPRequestHandler):
             self.reply(404, {'error': 'Not found'})
 
     def do_POST(self):
+        if self.path in ('/api/admin/remote-access', '/api/device/tunnel-status'):
+            return self.tunnel_request(post=True)
         if self.path in ('/api/admin/ios/pair', '/api/admin/ios/revoke', '/api/ios/enroll', '/api/ios/unlock'):
             return self.ios_enrollment()
         if self.path in ('/api/ios/status', '/api/ios/parent/policy', '/api/admin/ios/policy'):

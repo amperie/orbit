@@ -314,7 +314,14 @@ func enforce(_ policy: Policy?, development: Bool = false, dryRun: Bool = false)
     let task = Process(); task.executableURL = URL(fileURLWithPath: "/bin/ps")
     task.arguments = development ? ["-U", String(getuid()), "-o", "pid="] : ["-axo", "pid="]
     let pipe = Pipe(); task.standardOutput = pipe
+    // A launch failure must release both ends immediately; this daemon has no
+    // event-loop autorelease pool to eventually clean up an abandoned Pipe.
+    defer {
+        try? pipe.fileHandleForReading.close()
+        try? pipe.fileHandleForWriting.close()
+    }
     do { try task.run() } catch { return "Cannot enumerate processes" }
+    try? pipe.fileHandleForWriting.close() // Only the child should retain a writer.
     let data = pipe.fileHandleForReading.readDataToEndOfFile(); task.waitUntilExit()
     guard task.terminationStatus == 0 else { return "Process enumeration failed" }
     for line in String(decoding: data, as: UTF8.self).split(separator: "\n") {
@@ -391,68 +398,73 @@ catch { syncError = "No valid cached policy; initial enrollment required" }
 // Networking runs separately so a slow/offline server never pauses enforcement.
 DispatchQueue.global(qos: .utility).async {
     while true {
-        // Fetch separately; publish under the lock, keeping enforcement responsive.
-        do {
-            let requestStartedUptime = ProcessInfo.processInfo.systemUptime
-            let data = try request(settings, "/api/device/policy")
-            let receivedUptime = ProcessInfo.processInfo.systemUptime
-            let next = try decoder.decode(Policy.self, from: data); try next.validate()
+        let hasQuota = autoreleasepool {
+            // Fetch separately; publish under the lock, keeping enforcement responsive.
+            do {
+                let requestStartedUptime = ProcessInfo.processInfo.systemUptime
+                let data = try request(settings, "/api/device/policy")
+                let receivedUptime = ProcessInfo.processInfo.systemUptime
+                let next = try decoder.decode(Policy.self, from: data); try next.validate()
+                policyLock.lock()
+                let current = active
+                policyLock.unlock()
+                guard next.revision >= (current?.revision ?? 0) else { throw Failure.rollback }
+                // Persistence and scanning never hold the state lock during slow I/O.
+                try data.write(to: cache, options: .atomic)
+                try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: cache.path)
+                policyLock.lock()
+                    // Reject malformed or stale time samples. Use a conservative
+                    // anchor at receipt, never an earlier time than a previous anchor.
+                    let roundTrip = receivedUptime - requestStartedUptime
+                    if roundTrip >= 0, roundTrip <= 25,
+                       let timestamp = next.serverTimeUTC,
+                       next.enforcementTimeZone != nil && TimeZone(identifier: next.enforcementTimeZone!) != nil,
+                       let parsed = trustedFormatter.date(from: timestamp),
+                       let old = trustedNow(), parsed >= old.addingTimeInterval(-2) {
+                        trustedTime = (max(parsed, old), receivedUptime)
+                    } else if roundTrip >= 0, roundTrip <= 25,
+                              (trustedTime == nil || trustedNow() == nil),
+                              let timestamp = next.serverTimeUTC,
+                              next.enforcementTimeZone != nil && TimeZone(identifier: next.enforcementTimeZone!) != nil,
+                              let parsed = trustedFormatter.date(from: timestamp) {
+                        trustedTime = (parsed, receivedUptime)
+                    }
+                    if next.quota?.enabled == true || (next.appRules ?? [:]).values.contains(where: { $0.minutes != nil }) {
+                        lastQuotaSyncUptime = receivedUptime
+                    } else {
+                        lastQuotaSyncUptime = nil
+                    }
+                active = next; syncError = ""; policyLock.unlock()
+                if options.development && next.revision != current?.revision {
+                    log("Received policy revision \(next.revision)")
+                }
+            } catch {
+                policyLock.lock(); syncError = "Policy sync failed; keeping cached rules: \(error)"; policyLock.unlock()
+                if options.development { log("Sync failed (\(error)); cached policy remains active") }
+            }
             policyLock.lock()
-            let current = active
+            let report: [String: Any] = ["hostname": ProcessInfo.processInfo.hostName, "revision": active?.revision ?? 0, "agentVersion": options.development ? (options.dryRun ? "0.2.0-dev-dry-run" : "0.2.0-dev-enforce") : daemonVersion, "lastError": String([syncError, enforcementError].filter { !$0.isEmpty }.joined(separator: "; ").prefix(500))]
             policyLock.unlock()
-            guard next.revision >= (current?.revision ?? 0) else { throw Failure.rollback }
-            // Persistence and scanning never hold the state lock during slow I/O.
-            try data.write(to: cache, options: .atomic)
-            try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: cache.path)
+            do {
+                _ = try request(settings, "/api/device/status", body: JSONSerialization.data(withJSONObject: report))
+                if !options.development {
+                    let receipt: [String: Any] = ["pid": getpid(), "version": daemonVersion, "at": Date().timeIntervalSince1970]
+                    try JSONSerialization.data(withJSONObject: receipt).write(to: root.appendingPathComponent("health.json"), options: .atomic)
+                }
+            } catch { }
             policyLock.lock()
-                // Reject malformed or stale time samples. Use a conservative
-                // anchor at receipt, never an earlier time than a previous anchor.
-                let roundTrip = receivedUptime - requestStartedUptime
-                if roundTrip >= 0, roundTrip <= 25,
-                   let timestamp = next.serverTimeUTC,
-                   next.enforcementTimeZone != nil && TimeZone(identifier: next.enforcementTimeZone!) != nil,
-                   let parsed = trustedFormatter.date(from: timestamp),
-                   let old = trustedNow(), parsed >= old.addingTimeInterval(-2) {
-                    trustedTime = (max(parsed, old), receivedUptime)
-                } else if roundTrip >= 0, roundTrip <= 25,
-                          (trustedTime == nil || trustedNow() == nil),
-                          let timestamp = next.serverTimeUTC,
-                          next.enforcementTimeZone != nil && TimeZone(identifier: next.enforcementTimeZone!) != nil,
-                          let parsed = trustedFormatter.date(from: timestamp) {
-                    trustedTime = (parsed, receivedUptime)
-                }
-                if next.quota?.enabled == true || (next.appRules ?? [:]).values.contains(where: { $0.minutes != nil }) {
-                    lastQuotaSyncUptime = receivedUptime
-                } else {
-                    lastQuotaSyncUptime = nil
-                }
-            active = next; syncError = ""; policyLock.unlock()
-            if options.development && next.revision != current?.revision {
-                log("Received policy revision \(next.revision)")
-            }
-        } catch {
-            policyLock.lock(); syncError = "Policy sync failed; keeping cached rules: \(error)"; policyLock.unlock()
-            if options.development { log("Sync failed (\(error)); cached policy remains active") }
+            let hasQuota = active?.quota?.enabled == true || (active?.appRules ?? [:]).values.contains(where: { $0.minutes != nil })
+            policyLock.unlock()
+            return hasQuota
         }
-        policyLock.lock()
-        let report: [String: Any] = ["hostname": ProcessInfo.processInfo.hostName, "revision": active?.revision ?? 0, "agentVersion": options.development ? (options.dryRun ? "0.2.0-dev-dry-run" : "0.2.0-dev-enforce") : daemonVersion, "lastError": String([syncError, enforcementError].filter { !$0.isEmpty }.joined(separator: "; ").prefix(500))]
-        policyLock.unlock()
-        do {
-            _ = try request(settings, "/api/device/status", body: JSONSerialization.data(withJSONObject: report))
-            if !options.development {
-                let receipt: [String: Any] = ["pid": getpid(), "version": daemonVersion, "at": Date().timeIntervalSince1970]
-                try JSONSerialization.data(withJSONObject: receipt).write(to: root.appendingPathComponent("health.json"), options: .atomic)
-            }
-        } catch { }
-        policyLock.lock()
-        let hasQuota = active?.quota?.enabled == true || (active?.appRules ?? [:]).values.contains(where: { $0.minutes != nil })
-        policyLock.unlock()
         Thread.sleep(forTimeInterval: options.development ? options.pollSeconds : (hasQuota ? 30 : options.pollSeconds))
     }
 }
 while true {
-    policyLock.lock(); let snapshot = active; policyLock.unlock()
-    let error = enforce(snapshot, development: options.development, dryRun: options.dryRun)
-    policyLock.lock(); enforcementError = error; policyLock.unlock()
+    autoreleasepool {
+        policyLock.lock(); let snapshot = active; policyLock.unlock()
+        let error = enforce(snapshot, development: options.development, dryRun: options.dryRun)
+        policyLock.lock(); enforcementError = error; policyLock.unlock()
+    }
     Thread.sleep(forTimeInterval: 2)
 }
