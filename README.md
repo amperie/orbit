@@ -77,6 +77,37 @@ See [deploy/README.md](deploy/README.md) for SSH provisioning, proxy examples, b
 
 The blocker runs system-wide. Monitoring starts automatically for the selected logged-in user and restarts at login; it is not installed for every local user automatically. Installing Orbit does not by itself activate Safari website filtering.
 
+### Install or upgrade over SSH
+
+The installer supports terminal-only setup with no graphical prompts. From the
+extracted installer directory on the target Mac:
+
+```sh
+bash "Install Orbit.command" --cli --user YOUR_DAUGHTERS_MAC_USERNAME
+```
+
+Connect with `ssh -t` for sudo authorization and hidden token prompts. Your SSH
+login must have sudo access; the target account can be different. Existing valid
+settings are reused. Simultaneous SSH installs are rejected; the selected user's
+home must be available and writable before installation. The blocker starts immediately; a logged-out user's tracker
+starts at their next desktop login. An active desktop tracker starts immediately.
+
+For automation, supply credential JSON on stdin; omitted fields reuse saved values:
+
+```sh
+sudo -n ./OrbitSetup --install-cli ./Orbit.pkg --user TARGET_MAC_USERNAME --credentials-stdin < /secure/path/credentials.json
+```
+
+Supported JSON fields: `serverURL`, `deviceToken`, `activityToken`, `browserToken`,
+`extensionID`. Keep credential files private (`chmod 600`); do not pass tokens in
+command arguments. Missing or invalid fields fail before replacing binaries.
+The published installer must include this CLI support; older downloads do not.
+
+First-time Chrome policy activation still needs local approval or MDM. SSH setup
+preserves existing approved policy and writes the generated profile without opening
+any windows. Browser-token rotation requires updating the approved policy too.
+SSH tunnel provisioning remains separate. See [packaging/README.txt](packaging/README.txt).
+
 ### Upgrades and saved configuration
 
 Run the new **Install Orbit.command** again to update manually. It reuses format-valid settings for the same server and prompts for missing or invalid values. The privileged DEVICE token stays inside the administrator-authorized helper. Corrupt protected settings or a server mismatch may require review before setup can continue. Format validation does not establish that a saved token still authenticates against the VPS.
