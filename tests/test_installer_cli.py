@@ -23,7 +23,7 @@ class HeadlessInstallerTests(unittest.TestCase):
         harness = '''
 if CommandLine.arguments.count > 1 && CommandLine.arguments[1] == "--prompt" {
     do { _ = try terminalPrompt("Secret token", secret:true); print("Prompt complete"); exit(0) }
-    catch { fputs("Prompt cancelled: \(error)\\n", stderr); exit(1) }
+    catch { fputs("Prompt cancelled: \\(error)\\n", stderr); exit(1) }
 }
 if CommandLine.arguments.count == 3 && CommandLine.arguments[1] == "--hold-lock" {
     do {
@@ -52,7 +52,7 @@ if CommandLine.arguments.count == 4 && CommandLine.arguments[1] == "--stage" {
         cls.tmp.cleanup()
 
     def test_credentials_and_logged_out_tracker_lifecycle(self):
-        result = subprocess.run([str(self.checks)],check=True,text=True,capture_output=True)
+        result = subprocess.run([str(self.checks)],check=True,text=True,capture_output=True,timeout=60)
         self.assertIn('checks passed', result.stdout)
 
     def test_cli_stops_before_changes_without_administrator_access(self):
@@ -63,10 +63,18 @@ if CommandLine.arguments.count == 4 && CommandLine.arguments[1] == "--stage" {
         self.assertNotIn('osascript', result.stderr)
 
     def prompt(self, interrupt=None):
-        pid, master = pty.fork()
-        if pid == 0:
-            os.execv(str(self.checks), [str(self.checks), '--prompt'])
-        exited = False
+        # The unittest runner may already have HTTP-server threads. Never run
+        # Python code after forkpty(): macOS/Python can deadlock before exec.
+        master, slave = pty.openpty()
+        process = None
+        try:
+            process = subprocess.Popen([str(self.checks), '--prompt'],
+                stdin=slave, stdout=slave, stderr=slave, start_new_session=True)
+        except BaseException:
+            os.close(master)
+            raise
+        finally:
+            os.close(slave)
         output = b''
         try:
             deadline = time.monotonic() + 5
@@ -75,20 +83,17 @@ if CommandLine.arguments.count == 4 && CommandLine.arguments[1] == "--stage" {
                 if select.select([master],[],[],0.1)[0]: output += os.read(master,4096)
             self.assertFalse(termios.tcgetattr(master)[3] & termios.ECHO, 'Secret echo must be disabled before displaying the prompt')
             if interrupt:
-                os.kill(pid, interrupt)
+                process.send_signal(interrupt)
             else:
                 os.write(master, b'canary-token-must-not-be-echoed\n')
             deadline = time.monotonic() + 5
             while True:
-                finished, status = os.waitpid(pid, os.WNOHANG)
-                if finished:
-                    exited = True
+                if process.poll() is not None:
                     break
                 if time.monotonic() > deadline: self.fail('Prompt process did not exit')
                 time.sleep(0.01)
             self.assertTrue(termios.tcgetattr(master)[3] & termios.ECHO, 'Terminal echo must be restored after completion or interruption')
-            self.assertTrue(os.WIFEXITED(status))
-            self.assertEqual(os.WEXITSTATUS(status), 128 + interrupt if interrupt else 0)
+            self.assertEqual(process.returncode, 128 + interrupt if interrupt else 0)
             while select.select([master],[],[],0)[0]:
                 try: data = os.read(master,4096)
                 except OSError: break
@@ -96,9 +101,9 @@ if CommandLine.arguments.count == 4 && CommandLine.arguments[1] == "--stage" {
                 output += data
             self.assertNotIn(b'canary-token-must-not-be-echoed', output)
         finally:
-            if not exited:
-                os.kill(pid, signal.SIGKILL)
-                os.waitpid(pid, 0)
+            if process.poll() is None:
+                process.kill()
+            process.wait(timeout=5)
             os.close(master)
 
     def test_hidden_prompt_does_not_echo_secret_and_restores_terminal(self):
